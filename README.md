@@ -4,10 +4,10 @@
   <p><b>Cross-distro package fetch · verify · commit for iSH.</b><br>
   Downloads packages from Alpine, Debian, Void, Arch32, Kali and more — then <i>proves they run</i> before a single byte lands in <code>/usr</code>.</p>
 
-  ![version](https://img.shields.io/badge/version-0.2.0-informational)
-  ![platform](https://img.shields.io/badge/platform-iSH%20%2F%20i686-lightgrey)
-  ![license](https://img.shields.io/badge/license-MIT-green)
-  ![deps](https://img.shields.io/badge/runtime-POSIX%20sh-blue)
+  [![version](https://img.shields.io/badge/version-0.2.0-informational)](https://github.com/ItzzEIias/topish/releases)
+  [![platform](https://img.shields.io/badge/platform-iSH%20%2F%20i686-lightgrey)](https://github.com/ItzzEIias/topish#the-arch-problem-stated-plainly)
+  [![license](https://img.shields.io/badge/license-MIT-green)](https://github.com/ItzzEIias/topish/blob/main/LICENSE)
+  [![runtime](https://img.shields.io/badge/runtime-POSIX%20sh-blue)](https://github.com/ItzzEIias/topish/blob/main/bin/topish)
 </div>
 
 ---
@@ -62,7 +62,7 @@ iSH executes **32-bit x86 only**, on **musl**. Sources are tiered by how well th
 
 ```sh
 apk add curl binutils            # fetch + ar + readelf
-git clone https://github.com/<you>/topish
+git clone https://github.com/ItzzEIias/topish
 install -m755 topish/bin/topish /usr/local/bin/topish
 
 topish doctor                    # what your box can and can't do
@@ -163,12 +163,12 @@ Most useful contributions, in order:
 1. **A dependency manifest resolver** for gate 5 — auto-stage missing libs from the Alpine i386 repo instead of just reporting them.
 2. **`~/.topish/tests.d/<pkg>.sh` hook** so a package ships its own smoke command.
 3. A real screenshot / GIF of the TUI for this README.
-4. Source cases with evidence that gate 5–6 pass on them.
+4. Source cases with evidence that gates 5–6 pass on them.
 
 Open an issue with the `topish install … --dry-run` transcript before a PR that touches the gates.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT © [ItzzEIias](https://github.com/ItzzEIias) — see [LICENSE](LICENSE).
 
 Not affiliated with Alpine, Debian, Void, Arch Linux 32, Kali, Termux or iSH. Packages belong to their respective distros; check their licences before redistributing binaries.
