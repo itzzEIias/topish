@@ -1,0 +1,371 @@
+#!/bin/sh
+# =====================================================================
+#  TopIsh 0.2.0 - cross-distro fetch / verify / commit for iSH
+#  ash-safe · MIT · nothing commits until all 7 gates pass
+#  https://github.com/<you>/topish
+# =====================================================================
+set -u
+
+VERSION="0.2.0"
+ROOT="${TOPSH_ROOT:-$HOME/.topish}"
+MAX_BYTES="${TOPSH_MAX_BYTES:-26214400}"   # 25 MiB per package
+TEST_TIMEOUT="${TOPSH_TEST_TIMEOUT:-5}"
+STAGE="$ROOT/stage"; CACHE="$ROOT/cache"
+IDX="$ROOT/index.tsv"; FLIST="$ROOT/files"; LOGS="$ROOT/logs"
+
+if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then
+  R='\033[0m'; RED='\033[31m'; GRN='\033[32m'; YEL='\033[33m'; CYN='\033[36m'; DIM='\033[90m'
+else R=; RED=; GRN=; YEL=; CYN=; DIM=; fi
+c() { printf "\033[%sm%s\033[0m" "$1" "$2"; }
+[ -z "$R" ] && c() { printf '%s' "$2"; }
+
+W=${TOPSH_WIDTH:-$(tput cols 2>/dev/null || echo 46)}
+[ "$W" -lt 40 ] && W=40; [ "$W" -gt 72 ] && W=72
+[ -t 1 ] || W=46
+
+have() { command -v "$1" >/dev/null 2>&1; }
+die()  { printf '  %s %s\n' "$(c 31 FAIL)" "$1" >&2; exit 1; }
+
+rule() { printf '%s\n' "$1"; }
+bar()  { n=$((W-4)); i=0; printf '  '; while [ $i -lt $n ]; do printf '%s' "$1"; i=$((i+1)); done; printf '\n'; }
+row()  { s=$1; max=$((W-4)); [ "${#s}" -gt "$max" ] && s=$(printf '%s' "$s" | cut -b1-$((max-2)))".."
+         printf '  | %s' "$s"; printf '%*s' $((max-${#s})) ''; printf ' |\n'; }
+hdr()  { bar "$(printf "$CYN─$R")"; row "TopIsh $VERSION · $(uname -m) · $(libc_sys) · $(free_h) free"; }
+gate() { printf '  %s %-7s %s' "$(c 90 "[$1/7]")" "$2" "$3"; }
+
+free_h()   { set -- $(df -k "$HOME" 2>/dev/null | tail -1); awk -v k="${4:-0}" 'BEGIN{printf "%dM", k/1024}'; }
+libc_sys() { [ -e /lib/ld-musl-i386.so.1 ] && echo musl || echo "libc?"; }
+has_gcompat() { [ -e /lib/ld-linux.so.2 ] || have gcompat; }
+
+init() { for d in "$ROOT" "$STAGE" "$CACHE" "$FLIST" "$LOGS"; do mkdir -p "$d" || die "cannot create $d"; done; [ -f "$IDX" ] || : > "$IDX"; }
+
+# ---------------------------------------------------------------- ELF
+elf_arch() {
+  set -- $(od -An -tu1 -N20 "$1" 2>/dev/null)
+  [ $# -lt 20 ] && { echo notelf; return; }
+  [ "$1" = 127 ] && [ "$2" = 69 ] && [ "$3" = 76 ] && [ "$4" = 70 ] || { echo notelf; return; }
+  case $(( $19 + 256 * $20 )) in
+    3) echo "x86:32" ;; 62) echo "x86_64:64" ;; 40) echo "arm:32" ;; 183) echo "aarch64:64" ;; *) echo other ;;
+  esac
+}
+elf_interp() { tr -c '[:print:]' '\n' < "$1" 2>/dev/null | grep -m1 -oE '/lib/ld-[a-z0-9._-]+' || true; }
+elf_needed() {
+  if have readelf; then readelf -d "$1" 2>/dev/null | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p'
+  else tr -c '[:print:]' '\n' < "$1" 2>/dev/null | grep -E '^lib[^/]*\.so(\.[0-9]+)*$' | sort -u; fi
+}
+lib_present() { [ -e "/lib/$1" ] || [ -e "/usr/lib/$1" ] || [ -e "/usr/lib/gcompat/$1" ]; }
+
+# ------------------------------------------------------------ sources
+# tier | arch | kind | base   (base = dists-relative root)
+src_meta() {
+  case "$1" in
+    alpine)         echo "native|x86|apk|https://dl-cdn.alpinelinux.org/alpine/v3.20" ;;
+    alpine-edge)    echo "native|x86|apk|https://dl-cdn.alpinelinux.org/alpine/edge" ;;
+    void)           echo "native|i686|xbps|https://repo-default.voidlinux.org/current/musl" ;;
+    debian)         echo "gcompat|i386|deb|http://deb.debian.org/debian/dists/stable" ;;
+    devuan)         echo "gcompat|i386|deb|http://deb.devuan.org/merged/dists/daedalus" ;;
+    ubuntu)         echo "gcompat|i386|deb|http://archive.ubuntu.com/ubuntu/dists/jammy" ;;
+    kali)           echo "gcompat|i386|deb|http://http.kali.org/kali/dists/kali-rolling" ;;
+    parrot)         echo "gcompat|i386|deb|http://deb.parrot.sh/parrot/dists/lts" ;;
+    arch32)         echo "gcompat|i686|zst|https://mirror.archlinux32.org/i686" ;;
+    slackware)      echo "gcompat|i586|txz|https://mirrors.slackware.com/slackware/slackware-14.2" ;;
+    opensuse)       echo "legacy|i586|rpm|https://download.opensuse.org/distribution/leap/15.5/repo/oss" ;;
+    fedora-archive) echo "legacy|i686|rpm|https://archives.fedoraproject.org/pub/archive/fedora/linux/releases/31/Everything/i386/os" ;;
+    termux)         echo "noexec|aarch64|deb|https://packages.termux.dev/apt/termux-main/dists/stable" ;;
+    raspios)        echo "noexec|armhf|deb|http://raspbian.raspberrypi.com/raspbian/dists/bookworm" ;;
+    *) return 1 ;;
+  esac
+}
+
+fetch() {
+  if have curl; then curl -fsSL --retry 2 -o "$2" "$1"
+  elif have wget; then wget -q -O "$2" "$1"
+  else die "need curl or wget: apk add curl"; fi
+}
+
+need_for() {   # kind -> tools
+  case "$1" in
+    deb)  have ar || die "deb needs ar: apk add binutils" ;;
+    zst|xbps) have zstd || die "$1 needs zstd: apk add zstd" ;;
+    txz)  have xz || die "txz needs xz: apk add xz" ;;
+    rpm)  have rpm2cpio && have cpio || die "rpm needs rpm2cpio+cpio: apk add rpm2cpio cpio" ;;
+  esac
+}
+
+cached_index() {   # url key -> path (24h)
+  out="$CACHE/$2"
+  [ -f "$out" ] && [ $(( $(date +%s) - $(stat -c %Y "$out" 2>/dev/null || echo 0) )) -lt 86400 ] && { echo "$out"; return 0; }
+  fetch "$1" "$out.tmp" || { rm -f "$out.tmp"; return 1; }
+  mv "$out.tmp" "$out"; echo "$out"
+}
+
+deb_lookup() {   # base arch pkg -> relpath|ver|size
+  base=$1; arch=$2; pkg=$3
+  f=$(cached_index "$base/main/binary-$arch/Packages.gz" "idx-$(echo "$base" | sed 's#.*/dists/##;s#/#-#g')-$arch.gz") || return 1
+  gzip -dc "$f" | awk -v p="$pkg" '
+    BEGIN{RS="";FS="\n"}
+    { n="";fl="";v="";s="";a=""
+      for(i=1;i<=NF;i++){
+        if($i~/^Package: /)n=substr($i,10); else if($i~/^Filename: /)fl=substr($i,11)
+        else if($i~/^Version: /)v=substr($i,10); else if($i~/^Size: /)s=substr($i,7)
+        else if($i~/^Architecture: /)a=substr($i,15) }
+      if(n==p&&(a=="i386"||a=="all")){print fl"|"v"|"s";exit} }'
+}
+
+xbps_lookup() {   # base arch pkg
+  base=$1; arch=$2; pkg=$3
+  f=$(cached_index "$base/$arch-repodata" "idx-void-$arch") || return 1
+  fn=$(tr -c '[:print:]' '\n' < "$f" | grep -E "^$pkg-[0-9][^/]*\.$arch\.xbps$" | head -1)
+  [ -n "$fn" ] || return 1
+  echo "$fn|${fn%-*.xbps}|0"
+}
+
+arch_lookup() {   # base arch pkg
+  base=$1; arch=$2; pkg=$3
+  for repo in core extra community; do
+    f=$(cached_index "$base/$repo.db" "idx-arch32-$repo.db") || continue
+    hit=$(tar -xzOf "$f" --wildcards '*/desc' 2>/dev/null | awk -v p="$pkg" '
+      BEGIN{RS="";FS="\n"} {n="";fl="";cs=""
+        for(i=1;i<=NF;i++){if($i=="%NAME%")n=$(i+1);if($i=="%FILENAME%")fl=$(i+1);if($i=="%CSIZE%")cs=$(i+1)}
+        if(n==p){print fl"|"cs;exit}}')
+    [ -n "$hit" ] && { echo "$hit|$repo"; return 0; }
+  done
+  return 1
+}
+
+slack_lookup() {   # base pkg
+  f=$(cached_index "$1/PACKAGES.TXT" "idx-slack.txt") || return 1
+  awk -v p="$2" '
+    /^PACKAGE NAME: /{n=substr($0,15); sub(/^[ \t]+/,"",n)}
+    /^PACKAGE LOCATION: /{loc=substr($0,19); sub(/^[ \t]+/,"",loc)}
+    /^PACKAGE SIZE \(compressed\): /{sz=substr($0,29); sub(/[^0-9].*/,"",sz)}
+    n==p{print loc"/"n"|"sz;exit}' "$f"
+}
+
+rpm_lookup() {   # base pkg
+  base=$1; pkg=$2
+  md=$(cached_index "$base/repodata/repomd.xml" "idx-$(echo "$base" | sed 's#.*/##')-repomd.xml") || return 1
+  p=$(sed -n 's/.*href="\([^"]*primary\.xml\.gz\)".*/\1/p' "$md" | head -1)
+  [ -n "$p" ] || return 1
+  f=$(cached_index "$base/$p" "idx-$(echo "$base" | sed 's#.*/##')-primary.gz") || return 1
+  gzip -dc "$f" | awk -v p="$pkg" '
+    BEGIN{RS="</package>";FS="\n"}
+    { n="";loc="";a=""
+      if(match($0,/<name>[^<]*<\/name>/))n=substr($0,RSTART+6,RLENGTH-13)
+      if(match($0,/<location href="[^"]*"/))loc=substr($0,RSTART+16,RLENGTH-17)
+      if(match($0,/<arch>[^<]*<\/arch>/))a=substr($0,RSTART+6,RLENGTH-13)
+      if(n==p&&(a=="i586"||a=="i686"||a=="noarch")){print loc"|"a;exit} }'
+}
+
+resolve() {   # src pkg -> url|ver|size|kind
+  m=$(src_meta "$1") || return 1
+  tier=$(echo "$m" | cut -d'|' -f1); arch=$(echo "$m" | cut -d'|' -f2)
+  kind=$(echo "$m" | cut -d'|' -f3); base=$(echo "$m" | cut -d'|' -f4)
+  root=${base%%/dists/*}
+  case "$kind" in
+    apk)
+      apk fetch --no-progress -q -o "$CACHE" -X "$base/main" -X "$base/community" "$2" >/dev/null 2>&1 || return 1
+      f=$(ls -t "$CACHE/$2"-*.apk 2>/dev/null | head -1); [ -n "$f" ] || return 1
+      echo "file://$f|$(basename "$f" .apk | sed 's/.*-//')|$(wc -c < "$f")|apk" ;;
+    deb)
+      r=$(deb_lookup "$base" "$arch" "$2") || return 1; [ -n "$r" ] || return 1
+      echo "$root/$(echo "$r" | cut -d'|' -f1)|$(echo "$r" | cut -d'|' -f2)|$(echo "$r" | cut -d'|' -f3)|deb" ;;
+    xbps)
+      r=$(xbps_lookup "$base" "$arch" "$2") || return 1
+      echo "$base/$(echo "$r" | cut -d'|' -f1)|$(echo "$r" | cut -d'|' -f2)|0|xbps" ;;
+    zst)
+      r=$(arch_lookup "$base" "$arch" "$2") || return 1
+      echo "$base/$(echo "$r" | cut -d'|' -f3)/os/$arch/$(echo "$r" | cut -d'|' -f1)|-|$(echo "$r" | cut -d'|' -f2)|zst" ;;
+    txz)
+      r=$(slack_lookup "$base" "$2") || return 1
+      echo "$base/$(echo "$r" | cut -d'|' -f1)|-|$(echo "$r" | cut -d'|' -f2)|txz" ;;
+    rpm)
+      r=$(rpm_lookup "$base" "$2") || return 1
+      echo "$base/$(echo "$r" | cut -d'|' -f1)|-|0|rpm" ;;
+  esac
+}
+
+# ---------------------------------------------------------- unpacking
+unpack() {   # file kind stage
+  case "$2" in
+    apk)        tar -xzf "$1" -C "$3" 2>/dev/null ;;
+    deb)        ar p "$1" 'data.tar.*' 2>/dev/null | tar -x -C "$3" 2>/dev/null ;;
+    zst|xbps)   zstd -dcq "$1" 2>/dev/null | tar -x -C "$3" 2>/dev/null ;;
+    txz)        xz -dc "$1" 2>/dev/null | tar -x -C "$3" 2>/dev/null ;;
+    rpm)        ( cd "$3" && rpm2cpio "$1" 2>/dev/null | cpio -idm --quiet 2>/dev/null ) ;;
+    *) return 1 ;;
+  esac || return 1
+  rm -rf "$3"/usr/share/doc/* "$3"/usr/share/man/* "$3"/usr/share/info/* \
+         "$3"/usr/share/locale/* "$3"/usr/share/gtk-doc/* 2>/dev/null
+  find "$3" -name '*.la' -delete 2>/dev/null
+  have strip && find "$3" -type f -perm -u+x 2>/dev/null | while read -r f; do
+    [ "$(elf_arch "$f")" = "x86:32" ] && strip -s "$f" 2>/dev/null; done
+  return 0
+}
+
+# --------------------------------------------------------------- gates
+verify_tree() {   # stage
+  find "$1" -type f 2>/dev/null | while read -r f; do
+    a=$(elf_arch "$f"); [ "$a" = notelf ] && continue
+    b=$(basename "$f")
+    case "$a" in
+      x86:32) ;;
+      x86_64:64) echo "arch|$b|64-bit; iSH is 32-bit only" ;;
+      arm:32|aarch64:64) echo "arch|$b|$a; iSH emulates x86" ;;
+      *) echo "arch|$b|unrecognised machine" ;;
+    esac
+    case "$(elf_interp "$f")" in
+      *ld-musl*) ;;
+      *ld-linux*) has_gcompat || echo "libc|$b|glibc binary, run: apk add gcompat" ;;
+    esac
+    for lib in $(elf_needed "$f"); do lib_present "$lib" || echo "dep|$b|missing $lib"; done
+  done
+}
+
+smoke() {   # stage
+  found=0
+  for f in $(find "$1"/usr/bin "$1"/bin "$1"/usr/sbin "$1"/sbin -type f -perm -u+x 2>/dev/null | head -8); do
+    [ "$(elf_arch "$f")" = "x86:32" ] || continue
+    found=1; cmd="$f"
+    case "$(elf_interp "$f")" in
+      *ld-linux*) [ -e /lib/ld-linux.so.2 ] || continue
+                  cmd="/lib/ld-linux.so.2 --library-path $1/usr/lib:$1/lib $f" ;;
+    esac
+    for arg in --version -version -V -h --help ""; do
+      out=$(LD_LIBRARY_PATH="$1/usr/lib:$1/lib" timeout "$TEST_TIMEOUT" $cmd $arg 2>&1 </dev/null); rc=$?
+      case "$out" in *"not found"*|*symbol*|*Segmentation*|*"can't execute"*|*"error while loading"*) continue ;; esac
+      [ $rc -le 1 ] && [ -n "$out" ] && { echo "$out" | head -1; return 0; }
+    done
+  done
+  [ $found -eq 0 ] && { echo "(no executables; script-only package)"; return 0; }
+  return 1
+}
+
+commit() {   # stage pkg src ver size
+  s=$1; p=$2; list="$FLIST/$2.files"; : > "$list"
+  ( cd "$s" && find . -type f ) | while read -r rel; do
+    rel=${rel#./}; mkdir -p "/$(dirname "$rel")" 2>/dev/null
+    cp -a "$s/$rel" "/$rel" 2>/dev/null && echo "/$rel" >> "$list"
+  done
+  printf '%s\t%s\t%s\t%s\t%s\n' "$p" "$3" "$4" "$5" "$(date +%s)" >> "$IDX"
+}
+
+cmd_install() {
+  pkg=""; src="alpine"; yes=0; dry=0; notest=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --from) src="$2"; shift 2 ;; --yes|-y) yes=1; shift ;;
+    --dry-run) dry=1; shift ;; --no-test) notest=1; shift ;;
+    -*) die "unknown flag $1" ;; *) pkg="$1"; shift ;; esac; done
+  [ -n "$pkg" ] || die "usage: topish install <pkg> [--from kali] [--dry-run]"
+
+  m=$(src_meta "$src") || die "unknown source '$src' (try: topish sources)"
+  tier=$(echo "$m" | cut -d'|' -f1); arch=$(echo "$m" | cut -d'|' -f2); kind=$(echo "$m" | cut -d'|' -f3)
+
+  hdr; row "install $pkg from $src/$arch"; row "$(c 90 "tier: $tier")"; bar "$(printf "$CYN─$R")"; echo
+
+  gate 1 source "$src/$pkg"
+  r=$(resolve "$src" "$pkg") || { echo; die "not found in $src index (try: topish search $pkg $src)"; }
+  url=$(echo "$r" | cut -d'|' -f1); ver=$(echo "$r" | cut -d'|' -f2)
+  size=$(echo "$r" | cut -d'|' -f3); kind=$(echo "$r" | cut -d'|' -f4)
+  echo " $(c 32 "$ver")"
+
+  if [ "$size" -gt "$MAX_BYTES" ] 2>/dev/null; then
+    die "over budget (${size}B > ${MAX_BYTES}B); raise TOPSH_MAX_BYTES"; fi
+  need_for "$kind"
+
+  gate 2 fetch "$(basename "${url#file://}")"
+  rm -rf "$STAGE"; mkdir -p "$STAGE"; lf="$CACHE/dl.$kind"
+  case "$url" in file://*) cp "${url#file://}" "$lf" ;; *) fetch "$url" "$lf" || { echo; die "download failed"; } ;; esac
+  echo " $(c 32 ok)"
+
+  gate 3 unpack "$kind"
+  unpack "$lf" "$kind" "$STAGE" || { echo; die "extract failed (corrupt or unsupported archive)"; }
+  echo " $(find "$STAGE" -type f | wc -l | tr -d ' ') files"
+
+  gate 4 arch "ELF machine check"
+  af=$(verify_tree "$STAGE" | grep '^arch|')
+  if [ -n "$af" ]; then echo " $(c 31 FAIL)"
+    echo "$af" | sed 's/^arch|/    └ /;s/|/ — /' | head -5
+    [ "$tier" = noexec ] && printf '    %s\n' "$(c 90 'ARM packages: fetchable and inspectable, not executable here')"
+    [ "$dry" = 1 ] || rm -rf "$STAGE"; return 1; fi
+  echo " $(c 32 ok)"
+
+  gate 5 libc "interp + DT_NEEDED"
+  lf2=$(verify_tree "$STAGE" | grep -E '^(libc|dep)\|')
+  if [ -n "$lf2" ]; then echo " $(c 31 FAIL)"
+    echo "$lf2" | sed 's/^[a-z]*|/    └ /;s/|/ — /' | head -6
+    printf '    %s\n' "$(c 90 'resolve the above, then retry')"
+    [ "$dry" = 1 ] || rm -rf "$STAGE"; return 1; fi
+  echo " $(c 32 ok)"
+
+  gate 6 smoke "run under ${TEST_TIMEOUT}s timeout"
+  if [ "$notest" = 1 ]; then echo " $(c 90 skipped)"; else
+    out=$(smoke "$STAGE")
+    if [ $? -ne 0 ]; then echo " $(c 31 FAIL)"; [ "$dry" = 1 ] || rm -rf "$STAGE"; return 1; fi
+    echo " $(c 32 ok)"; echo "    $(c 90 "$out")"; fi
+
+  gate 7 space "$(du -sk "$STAGE" | cut -f1) KiB staged"; echo " $(c 32 ok)"
+  echo; bar "$(printf "$CYN─$R")"; row "$(c 32 PASS) all gates · rollback armed"
+
+  if [ "$dry" = 1 ]; then row "dry-run: tree left in $STAGE"; return 0; fi
+  if [ "$yes" = 0 ]; then printf '  commit? [y/N] '; read -r a; case "$a" in y|Y) ;; *) row "aborted, staging kept"; return 1 ;; esac; fi
+  commit "$STAGE" "$pkg" "$src" "$ver" "$size"; rm -rf "$STAGE" "$lf"
+  printf '\n  %s installed %s %s (%s files)\n  %s\n' "$(c 32 ✓)" "$pkg" "$ver" \
+    "$(wc -l < "$FLIST/$pkg.files")" "$(c 90 "undo: topish remove $pkg")"
+}
+
+cmd_remove() {
+  [ -f "$FLIST/$1.files" ] || die "$1 not installed"
+  n=0; while read -r f; do rm -f "$f" 2>/dev/null && n=$((n+1)); done < "$FLIST/$1.files"
+  rm -f "$FLIST/$1.files"; grep -v "^$1	" "$IDX" > "$IDX.t" 2>/dev/null; mv "$IDX.t" "$IDX"
+  printf '  %s removed %s (%s files)\n' "$(c 32 ✓)" "$1" "$n"
+}
+
+cmd_search() {
+  q=$1; src=${2:-alpine}; m=$(src_meta "$src") || die "unknown source"
+  arch=$(echo "$m" | cut -d'|' -f2); kind=$(echo "$m" | cut -d'|' -f3); base=$(echo "$m" | cut -d'|' -f4)
+  hdr; row "search '$q' in $src"; bar "$(printf "$CYN─$R")"
+  case "$kind" in
+    apk) apk search -q "$q" 2>/dev/null | head -15 | while read -r l; do row "  $l"; done ;;
+    deb) f=$(cached_index "$base/main/binary-$arch/Packages.gz" "idx-$(echo "$base"|sed 's#.*/dists/##;s#/#-#g')-$arch.gz") \
+           && gzip -dc "$f" | awk -v q="$q" 'BEGIN{RS="";FS="\n"}
+             {n="";v="";for(i=1;i<=NF;i++){if($i~/^Package: /)n=substr($i,10);if($i~/^Version: /)v=substr($i,10)}
+              if(n~q)print n" "v}' | head -15 | while read -r l; do row "  $l"; done ;;
+    *) row "  $(c 90 "no search backend for $kind; try: topish install $q --from $src")" ;;
+  esac
+}
+
+cmd_list() { hdr; row "installed"; bar "$(printf "$CYN─$R")"
+  [ -s "$IDX" ] || { row "  nothing"; return 0; }
+  awk -F'\t' '{printf "  %-20s %-10s %s\n",$1,$2,$3}' "$IDX" | while read -r l; do row "$l"; done; }
+
+cmd_sources() { hdr; row "sources"; bar "$(printf "$CYN─$R")"
+  for s in alpine alpine-edge void debian devuan ubuntu kali parrot arch32 slackware opensuse fedora-archive termux raspios; do
+    m=$(src_meta "$s"); t=$(echo "$m" | cut -d'|' -f1); a=$(echo "$m" | cut -d'|' -f2)
+    case "$t" in native) col=32 ;; gcompat) col=33 ;; legacy) col=33 ;; *) col=31 ;; esac
+    row "  $(printf "%-16s" "$s") $(c $col "$t") $(c 90 "$a")"; done
+  echo; row "  $(c 90 'native = musl x86 · gcompat = glibc x86 · noexec = ARM')"; }
+
+cmd_doctor() { hdr; row "environment"; bar "$(printf "$CYN─$R")"
+  row "  arch      $(uname -m)"; row "  libc      $(libc_sys)"
+  row "  gcompat   $(has_gcompat && echo present || echo MISSING)"
+  row "  extract   $(have zstd && echo zstd || echo -zstd) $(have rpm2cpio && echo rpm2cpio || echo -rpm2cpio) $(have xz && echo xz || echo -xz)"
+  row "  readelf   $(have readelf && echo yes || echo 'no (strings fallback)')"
+  row "  free      $(free_h)"; row "  budget    $((MAX_BYTES/1024/1024)) MiB/pkg"
+  echo; [ "$(libc_sys)" = musl ] || row "  $(c 33 'rootfs is not musl-alpine')"
+  row "  $(c 90 'apk add curl binutils zstd rpm2cpio cpio xz gcompat')"; }
+
+case "${1:-help}" in
+  install|i) init; shift; cmd_install "$@" ;;
+  remove|rm) init; cmd_remove "${2:-}" ;;
+  search|s)  init; cmd_search "${2:-}" "${3:-alpine}" ;;
+  list|ls)   init; cmd_list ;;
+  sources)   init; cmd_sources ;;
+  doctor)    init; cmd_doctor ;;
+  version)   echo "topish $VERSION" ;;
+  *) hdr; bar "$(printf "$CYN─$R")"
+     row "  topish install <pkg> --from <src>"
+     row "  topish search <q> [src] · sources · doctor"
+     row "  topish list · remove <pkg>"
+     bar "$(printf "$CYN─$R")"; row "  $(c 90 'gates: arch · libc · deps · smoke · space')" ;;
+esac
